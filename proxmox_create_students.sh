@@ -2,19 +2,19 @@
 set -euo pipefail
 
 # ==========================================================
-# Proxmox VE: создание студентов из CSV с РУССКИМИ ФИО
-# Вход:  students.csv  (Фамилия,Имя) на русском
+# Proxmox VE 8.x: создание студентов из CSV с РУССКИМИ ФИО
+# Вход:  students.csv  (Фамилия,Имя) UTF-8
 # Выход: students_passwords.csv: "Фамилия Имя;username;password;pool"
 #
 # Делает:
-# - создает роли (если нет)
-# - создает группу students
+# - роли/группа (если нет)
 # - ACL:
-#    /storage/<ISO_STORAGE>  -> Datastore.Audit (видеть ISO)
-#    /vms                    -> VM.Config.Network (видеть Bridge/vmbr0 в UI)
-#    /nodes/<node>           -> Sys.Audit (чтобы UI видел bridges)
+#    /storage/<ISO_STORAGE>    -> ISOReader (Datastore.Audit)
+#    /storage/<VM_STORAGE>     -> VMStore   (Datastore.Audit + Datastore.AllocateSpace)
+#    /sdn/zones/localnetwork/<BRIDGE> -> SDNUse (SDN.Use)  [чтобы был виден bridge и не было 403]
+#    /nodes/<node>             -> NodeAudit (Sys.Audit)    [не обязательно, но полезно для UI]
 # - для каждого студента:
-#    user:  lastname_translit@pve (уникализирует при совпадениях)
+#    user:  <lastname_translit>@pve (уникализирует)
 #    pool:  student_<login>
 #    ACL на /pool/<pool> -> StudentVM
 # ==========================================================
@@ -31,6 +31,12 @@ OUT="students_passwords.csv"
 # Storage с ISO (Datacenter -> Storage)
 ISO_STORAGE="iso-students"
 
+# Storage для ДИСКОВ VM (например: local-lvm или local-zfs и т.п.)
+VM_STORAGE="local-lvm"
+
+# Какой bridge разрешаем студентам (обычно vmbr0)
+BRIDGE="vmbr0"
+
 # (опционально) дата окончания доступа (YYYY-MM-DD), пусто = без срока
 EXPIRE_DATE=""
 
@@ -40,10 +46,11 @@ DRY_RUN=0
 # --------------------
 # Роли
 # --------------------
-ROLE_VM="StudentVM"
+ROLE_STUDENT_VM="StudentVM"
 ROLE_ISO="ISOReader"
+ROLE_VMSTORE="StudentVMStore"
 ROLE_NODE_AUDIT="StudentNodeAudit"
-ROLE_VMS_NETCFG="StudentVmsNetCfg"
+ROLE_SDN_USE="StudentSDNUse"  # кастомная роль на случай, если PVESDNUser недоступна
 
 # --------------------
 # Helpers
@@ -83,53 +90,27 @@ get_nodes() {
   pvesh get /nodes --output-format json | sed -n 's/.*"node":"\([^"]*\)".*/\1/p'
 }
 
-# --- Транслитерация RU -> EN (простая, практичная) ---
-# Пример: "Иванов" -> "ivanov", "Щербаков" -> "shcherbakov"
+# --- RU -> EN транслитерация (Unicode-нормально, через python3) ---
 translit_ru_to_en() {
   local s="$1"
-  # в нижний регистр (рус/лат)
-  s="$(echo "$s" | tr '[:upper:]' '[:lower:]')"
+  python3 - <<'PY' "$s"
+import re, sys
 
-  # буквы, которые лучше обработать сначала как двубуквенные
-  s="$(echo "$s" | sed \
-    -e 's/щ/shch/g' \
-    -e 's/ш/sh/g' \
-    -e 's/ч/ch/g' \
-    -e 's/ц/ts/g' \
-    -e 's/ю/yu/g' \
-    -e 's/я/ya/g' \
-    -e 's/ё/yo/g' \
-    -e 's/ж/zh/g' \
-    -e 's/х/kh/g' \
-    -e 's/э/e/g' \
-    -e 's/й/y/g' \
-    -e 's/а/a/g' \
-    -e 's/б/b/g' \
-    -e 's/в/v/g' \
-    -e 's/г/g/g' \
-    -e 's/д/d/g' \
-    -e 's/е/e/g' \
-    -e 's/з/z/g' \
-    -e 's/и/i/g' \
-    -e 's/к/k/g' \
-    -e 's/л/l/g' \
-    -e 's/м/m/g' \
-    -e 's/н/n/g' \
-    -e 's/о/o/g' \
-    -e 's/п/p/g' \
-    -e 's/р/r/g' \
-    -e 's/с/s/g' \
-    -e 's/т/t/g' \
-    -e 's/у/u/g' \
-    -e 's/ф/f/g' \
-    -e 's/ъ//g' \
-    -e 's/ы/y/g' \
-    -e 's/ь//g' \
-  )"
+s = sys.argv[1].strip().casefold()
 
-  # нормализуем: всё, что не латиница/цифры/._- -> _
-  s="$(echo "$s" | sed -E 's/[^a-z0-9._-]+/_/g; s/^_+|_+$//g')"
-  echo "$s"
+m = {
+  "а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","ж":"zh","з":"z","и":"i","й":"y",
+  "к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f",
+  "х":"kh","ц":"ts","ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+}
+
+out = "".join(m.get(ch, ch) for ch in s)
+
+# всё, что не латиница/цифры/._- -> _
+out = re.sub(r"[^a-z0-9._-]+", "_", out)
+out = out.strip("_")
+print(out)
+PY
 }
 
 # --------------------
@@ -143,18 +124,26 @@ if [[ ! -f "$INPUT" ]]; then
 fi
 
 if ! storage_exists "$ISO_STORAGE"; then
-  echo "Storage '$ISO_STORAGE' не найден (Datacenter -> Storage)." >&2
-  echo "Исправь ISO_STORAGE в скрипте или создай storage с таким именем." >&2
+  echo "Storage ISO '$ISO_STORAGE' не найден (Datacenter -> Storage)." >&2
+  exit 1
+fi
+
+if ! storage_exists "$VM_STORAGE"; then
+  echo "Storage VM '$VM_STORAGE' не найден (Datacenter -> Storage)." >&2
   exit 1
 fi
 
 # 1) Роли
-if ! role_exists "$ROLE_VM"; then
-  echo "Создаю роль $ROLE_VM ..."
-  PRIVS_VM="VM.Audit,VM.Allocate,VM.Console,VM.PowerMgmt,VM.Config.CDROM,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Disk,VM.Config.Options,Datastore.Audit"
-  run "pveum role add '$ROLE_VM' -privs '$PRIVS_VM'"
+if ! role_exists "$ROLE_STUDENT_VM"; then
+  echo "Создаю роль $ROLE_STUDENT_VM ..."
+  # Минимально нужное студенту в своём пуле:
+  # - создавать VM, открывать консоль, включать/выключать
+  # - настраивать CPU/RAM/Disk/Network/CDROM/Options
+  # - (Pool.Audit) чтобы UI нормально показывал пул
+  PRIVS_VM="VM.Audit,VM.Allocate,VM.Console,VM.PowerMgmt,VM.Config.CDROM,VM.Config.CPU,VM.Config.Memory,VM.Config.Network,VM.Config.Disk,VM.Config.Options,Pool.Audit"
+  run "pveum role add '$ROLE_STUDENT_VM' -privs '$PRIVS_VM'"
 else
-  echo "Роль $ROLE_VM уже существует."
+  echo "Роль $ROLE_STUDENT_VM уже существует."
 fi
 
 if ! role_exists "$ROLE_ISO"; then
@@ -164,6 +153,13 @@ else
   echo "Роль $ROLE_ISO уже существует."
 fi
 
+if ! role_exists "$ROLE_VMSTORE"; then
+  echo "Создаю роль $ROLE_VMSTORE ..."
+  run "pveum role add '$ROLE_VMSTORE' -privs 'Datastore.Audit,Datastore.AllocateSpace'"
+else
+  echo "Роль $ROLE_VMSTORE уже существует."
+fi
+
 if ! role_exists "$ROLE_NODE_AUDIT"; then
   echo "Создаю роль $ROLE_NODE_AUDIT ..."
   run "pveum role add '$ROLE_NODE_AUDIT' -privs 'Sys.Audit'"
@@ -171,11 +167,17 @@ else
   echo "Роль $ROLE_NODE_AUDIT уже существует."
 fi
 
-if ! role_exists "$ROLE_VMS_NETCFG"; then
-  echo "Создаю роль $ROLE_VMS_NETCFG ..."
-  run "pveum role add '$ROLE_VMS_NETCFG' -privs 'VM.Config.Network'"
+# SDN.Use: в PVE 8 это обязательно, иначе bridge/vmbr0 не виден и 403 при создании NIC.
+# Если есть builtin роль PVESDNUser — используем её. Если нет — создаём кастомную с SDN.Use.
+SDN_ROLE_TO_USE="PVESDNUser"
+if ! role_exists "$SDN_ROLE_TO_USE"; then
+  SDN_ROLE_TO_USE="$ROLE_SDN_USE"
+  if ! role_exists "$SDN_ROLE_TO_USE"; then
+    echo "PVESDNUser не найден, создаю роль $SDN_ROLE_TO_USE (SDN.Use) ..."
+    run "pveum role add '$SDN_ROLE_TO_USE' -privs 'SDN.Use'"
+  fi
 else
-  echo "Роль $ROLE_VMS_NETCFG уже существует."
+  echo "Builtin роль PVESDNUser найдена — использую её."
 fi
 
 # 2) Группа
@@ -186,14 +188,20 @@ else
   echo "Группа $GROUP уже существует."
 fi
 
-# 3) ACL на группу
+# 3) ACL на группу (общие)
 echo "ACL: ISO storage /storage/$ISO_STORAGE -> $ROLE_ISO"
 run "pveum acl modify '/storage/$ISO_STORAGE' -group '$GROUP' -role '$ROLE_ISO'"
 
-echo "ACL: /vms -> $ROLE_VMS_NETCFG (видимость Bridge/vmbr0 в UI)"
-run "pveum acl modify '/vms' -group '$GROUP' -role '$ROLE_VMS_NETCFG'"
+echo "ACL: VM disk storage /storage/$VM_STORAGE -> $ROLE_VMSTORE"
+run "pveum acl modify '/storage/$VM_STORAGE' -group '$GROUP' -role '$ROLE_VMSTORE'"
 
-echo "ACL: Sys.Audit на ноды (для видимости bridges)"
+echo "ACL: SDN.Use на bridge $BRIDGE (чтобы bridge был виден в VM Wizard)"
+# точечно на один bridge:
+run "pveum acl modify '/sdn/zones/localnetwork/$BRIDGE' -group '$GROUP' -role '$SDN_ROLE_TO_USE'"
+# если хочешь разрешить ВСЕ bridges, замени строку выше на:
+# run \"pveum acl modify '/sdn/zones/localnetwork' -group '$GROUP' -role '$SDN_ROLE_TO_USE'\"
+
+echo "ACL: Sys.Audit на ноды (полезно для UI)"
 for n in $(get_nodes); do
   echo "  - /nodes/$n -> $ROLE_NODE_AUDIT"
   run "pveum acl modify '/nodes/$n' -group '$GROUP' -role '$ROLE_NODE_AUDIT'"
@@ -205,11 +213,14 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 fi
 
 # 5) Студенты
-echo "Создаю студентов из $INPUT (русские ФИО -> логин транслитом) ..."
+echo "Создаю студентов из $INPUT ..."
 
+# поддержка CRLF и пустых строк
 while IFS=',' read -r LAST_RU FIRST_RU; do
   LAST_RU="$(trim "${LAST_RU:-}")"
   FIRST_RU="$(trim "${FIRST_RU:-}")"
+  LAST_RU="${LAST_RU%$'\r'}"
+  FIRST_RU="${FIRST_RU%$'\r'}"
 
   [[ -z "$LAST_RU" ]] && continue
   [[ "$LAST_RU" =~ ^# ]] && continue
@@ -222,7 +233,7 @@ while IFS=',' read -r LAST_RU FIRST_RU; do
     continue
   fi
 
-  # Уникализация логина при совпадениях: ivanov, ivanov -> ivanov2 ...
+  # Уникализация логина при совпадениях: ivanov, ivanov2 ...
   suffix=0
   while :; do
     if [[ "$suffix" -eq 0 ]]; then
@@ -239,14 +250,18 @@ while IFS=',' read -r LAST_RU FIRST_RU; do
   done
 
   pool="student_${login}"
-  password="$(openssl rand -base64 16 | tr -d '=+/ ' | cut -c1-12)"
+  password="$(openssl rand -base64 24 | tr -d '=+/ ' | cut -c1-12)"
 
   echo "==> $fio_ru -> $username / $pool"
 
-  if [[ -n "$EXPIRE_DATE" ]]; then
-    run "pveum user add '$username' --password '$password' --expire '$EXPIRE_DATE' --comment 'Student $fio_ru'"
+  if user_exists "$username"; then
+    echo "    user уже существует, пропускаю создание пользователя"
   else
-    run "pveum user add '$username' --password '$password' --comment 'Student $fio_ru'"
+    if [[ -n "$EXPIRE_DATE" ]]; then
+      run "pveum user add '$username' --password '$password' --expire '$EXPIRE_DATE' --comment 'Student $fio_ru'"
+    else
+      run "pveum user add '$username' --password '$password' --comment 'Student $fio_ru'"
+    fi
   fi
 
   run "pveum user modify '$username' -group '$GROUP'"
@@ -255,7 +270,8 @@ while IFS=',' read -r LAST_RU FIRST_RU; do
     run "pvesh create /pools --poolid '$pool'"
   fi
 
-  run "pveum acl modify '/pool/$pool' -user '$username' -role '$ROLE_VM'"
+  # Права студента ТОЛЬКО на свой pool
+  run "pveum acl modify '/pool/$pool' -user '$username' -role '$ROLE_STUDENT_VM'"
 
   if [[ "$DRY_RUN" -eq 0 ]]; then
     echo "${fio_ru};${username};${password};${pool}" >> "$OUT"
@@ -269,3 +285,5 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   echo "Файл с паролями: $OUT"
 fi
 echo "ВАЖНО: студентам нужно выйти/войти в веб-интерфейс Proxmox, чтобы обновились права."
+echo
+echo "Подсказка студентам: при создании VM обязательно выбирайте свой pool (student_<login>)."
